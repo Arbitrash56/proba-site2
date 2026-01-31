@@ -63,7 +63,8 @@ export async function POST(request: NextRequest) {
             ? { email: identifier, emailVerified: true }
             : { phone: identifier, phoneVerified: true }),
           referralCode: userReferralCode,
-          profile: {},
+          profile: JSON.stringify({}),
+          payoutMethods: JSON.stringify([]),
           status: 'ACTIVE',
         },
       });
