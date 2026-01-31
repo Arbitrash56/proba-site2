@@ -1,0 +1,581 @@
+// CPA Micro-Tasks Platform - Database Schema
+// Multi-tenant architecture with 11 core tables
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+}
+
+// ============================================================================
+// MULTI-TENANCY
+// ============================================================================
+
+model Tenant {
+  id        String   @id @default(uuid())
+  slug      String   @unique // brand1, brand2, brand3
+  hostnames String // JSON: ["brand1.com", "www.brand1.com"]
+  name      String   // Display name
+  logoUrl   String?  @map("logo_url")
+
+  // Theme configuration (colors, fonts)
+  themeConfig String @default("{}") @map("theme_config")
+
+  // Settings (payout limits, minimums, terms)
+  settings String @default("{}") // {minPayout: 100, maxPayout: 50000, ...}
+
+  // Referral configuration (L1-L7 percentages)
+  referralConfig String @default("{\"L1\":10,\"L2\":5,\"L3\":2,\"L4\":1,\"L5\":1,\"L6\":0.5,\"L7\":0.5}") @map("referral_config")
+
+  isActive  Boolean  @default(true) @map("is_active")
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  // Relations
+  users          User[]
+  offers         Offer[]
+  chats          Chat[]
+  auditLogs      AuditLog[] @relation("TenantAuditLogs")
+  payoutRequests PayoutRequest[]
+  otpCodes       OtpCode[]
+  referrals      Referral[]
+
+  @@map("tenants")
+}
+
+// ============================================================================
+// USERS & AUTH
+// ============================================================================
+
+enum UserRole {
+  USER
+  MANAGER
+  ADMIN
+}
+
+enum UserStatus {
+  ACTIVE
+  SUSPENDED
+  BANNED
+}
+
+enum KycStatus {
+  NONE
+  PENDING
+  VERIFIED
+  REJECTED
+}
+
+model User {
+  id       String   @id @default(uuid())
+  tenantId String   @map("tenant_id")
+  tenant   Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  role   UserRole   @default(USER)
+  status UserStatus @default(ACTIVE)
+
+  // Auth credentials
+  email         String?   @unique
+  phone         String?   @unique
+  emailVerified Boolean   @default(false) @map("email_verified")
+  phoneVerified Boolean   @default(false) @map("phone_verified")
+  passwordHash  String?   @map("password_hash") // Optional if using only OTP
+
+  // Profile data (JSONB for flexibility)
+  profile String @default("{}") // {firstName, lastName, birthDate, country, ...}
+
+  // KYC
+  kycStatus KycStatus @default(NONE) @map("kyc_status")
+
+  // Payout methods
+  payoutMethods String @default("[]") @map("payout_methods") // [{type: "card", details: "4111...", verified: true}]
+
+  // Referral system
+  referralCode String  @unique @map("referral_code") // Personal invite code
+  referredById String? @map("referred_by_id") // Who invited this user
+  referredBy   User?   @relation("Referrals", fields: [referredById], references: [id])
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  // Relations
+  sessions           Session[]
+  tasks              Task[]
+  chatsAsUser        Chat[]             @relation("UserChats")
+  chatsAsManager     Chat[]             @relation("ManagerChats")
+  chatMessages       ChatMessage[]
+  ledgerAccount      LedgerAccount?
+  payoutRequests     PayoutRequest[]
+  referrals          User[]             @relation("Referrals")
+  inviterReferrals   Referral[]         @relation("InviterReferrals")
+  inviteeReferrals   Referral[]         @relation("InviteeReferrals")
+  reviewedTasks      Task[]             @relation("ReviewedTasks")
+  auditLogs          AuditLog[]         @relation("ActorAuditLogs")
+  ledgerEntriesCreated LedgerEntry[]    @relation("CreatedByUser")
+
+  @@index([tenantId])
+  @@index([email])
+  @@index([phone])
+  @@index([referralCode])
+  @@map("users")
+}
+
+model OtpCode {
+  id         String   @id @default(uuid())
+  tenantId   String   @map("tenant_id")
+  tenant     Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  identifier String   // email or phone
+  code       String   // 6-digit code
+  expiresAt  DateTime @map("expires_at")
+  usedAt     DateTime? @map("used_at")
+  createdAt  DateTime @default(now()) @map("created_at")
+
+  @@index([identifier, code])
+  @@map("otp_codes")
+}
+
+model Session {
+  id           String   @id @default(uuid())
+  userId       String   @map("user_id")
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  refreshToken String   @unique @map("refresh_token")
+  userAgent    String?  @map("user_agent")
+  ipAddress    String?  @map("ip_address")
+  expiresAt    DateTime @map("expires_at")
+  createdAt    DateTime @default(now()) @map("created_at")
+
+  @@index([userId])
+  @@map("sessions")
+}
+
+// ============================================================================
+// REFERRALS (MLM 7 LEVELS)
+// ============================================================================
+
+model Referral {
+  id        String   @id @default(uuid())
+  tenantId  String   @map("tenant_id")
+  tenant    Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  inviterId String   @map("inviter_id") // Who invited
+  inviter   User     @relation("InviterReferrals", fields: [inviterId], references: [id], onDelete: Cascade)
+
+  inviteeId String   @map("invitee_id") // Who was invited
+  invitee   User     @relation("InviteeReferrals", fields: [inviteeId], references: [id], onDelete: Cascade)
+
+  level     Int      // 1-7 (depth in tree)
+  path      String   // Materialized path: "uuid1.uuid2.uuid3"
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@unique([inviterId, inviteeId])
+  @@index([inviterId, level])
+  @@index([inviteeId])
+  @@index([path])
+  @@map("referrals")
+}
+
+// ============================================================================
+// OFFERS & TASKS
+// ============================================================================
+
+enum OfferCategory {
+  FINANCE
+  SURVEYS
+  APPS
+  E_COMMERCE
+  INSURANCE
+  EDUCATION
+  OTHER
+}
+
+enum DifficultyLevel {
+  EASY
+  MEDIUM
+  HARD
+}
+
+model Offer {
+  id          String          @id @default(uuid())
+  tenantId    String          @map("tenant_id")
+  tenant      Tenant          @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  title       String
+  description String          
+  category    OfferCategory   @default(OTHER)
+  imageUrl    String?         @map("image_url")
+
+  // Reward
+  rewardAmount   Decimal  @map("reward_amount")
+  rewardCurrency String  @default("RUB") @map("reward_currency")
+
+  // Difficulty & time
+  difficultyLevel DifficultyLevel @default(MEDIUM) @map("difficulty_level")
+  estimatedTime   Int             @default(10) @map("estimated_time") // minutes
+
+  // Requirements
+  requiresVerification Boolean @default(false) @map("requires_verification")
+
+  // Reimbursement (compensation)
+  reimbursementEnabled Boolean @default(false) @map("reimbursement_enabled")
+  reimbursementRules   String    @default("{}") @map("reimbursement_rules") // {maxAmount, coveredTypes}
+
+  // Terms
+  termsAndConditions String    @map("terms_and_conditions")
+  disclaimers        String @default("[]") // JSON array of disclaimer texts
+
+  // Limits
+  limits String @default("{}") // {maxCompletionsPerUser: 1, dailyLimit: 100}
+
+  // Status & scheduling
+  isActive  Boolean   @default(true) @map("is_active")
+  startsAt  DateTime? @map("starts_at")
+  endsAt    DateTime? @map("ends_at")
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  // Relations
+  steps OfferStep[]
+  tasks Task[]
+
+  @@index([tenantId])
+  @@index([category])
+  @@index([isActive])
+  @@map("offers")
+}
+
+enum StepType {
+  INFO    // Informational block
+  FORM    // Form with fields
+  UPLOAD  // File upload
+  CONFIRM // Checkboxes/agreements
+  QUIZ    // Control questions
+}
+
+model OfferStep {
+  id          String   @id @default(uuid())
+  offerId     String   @map("offer_id")
+  offer       Offer    @relation(fields: [offerId], references: [id], onDelete: Cascade)
+
+  order       Int      // Step order (0, 1, 2...)
+  type        StepType
+  title       String
+  description String   
+
+  // JSON Schema for validation
+  schema String @default("{}") // {fields: [...], questions: [...]}
+
+  validationRules String    @default("{}") @map("validation_rules")
+  isRequired      Boolean @default(true) @map("is_required")
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  // Relations
+  taskStepData TaskStepData[]
+
+  @@index([offerId, order])
+  @@map("offer_steps")
+}
+
+enum TaskStatus {
+  DRAFT
+  IN_PROGRESS
+  SUBMITTED
+  UNDER_REVIEW
+  APPROVED
+  REJECTED
+  PAID
+}
+
+model Task {
+  id        String     @id @default(uuid())
+  userId    String     @map("user_id")
+  user      User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  offerId   String     @map("offer_id")
+  offer     Offer      @relation(fields: [offerId], references: [id], onDelete: Cascade)
+
+  status      TaskStatus @default(DRAFT)
+  currentStep Int        @default(0) @map("current_step") // Current step index
+
+  startedAt    DateTime?  @map("started_at")
+  submittedAt  DateTime?  @map("submitted_at")
+  reviewedAt   DateTime?  @map("reviewed_at")
+  reviewedById String?    @map("reviewed_by_id")
+  reviewedBy   User?      @relation("ReviewedTasks", fields: [reviewedById], references: [id])
+
+  rejectionReason String?  @map("rejection_reason")
+  approvalNotes   String?  @map("approval_notes")
+
+  metadata String @default("{}") // Additional data
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  // Relations
+  stepData TaskStepData[]
+  chats    Chat[]
+
+  @@index([userId])
+  @@index([offerId])
+  @@index([status])
+  @@map("tasks")
+}
+
+model TaskStepData {
+  id       String   @id @default(uuid())
+  taskId   String   @map("task_id")
+  task     Task     @relation(fields: [taskId], references: [id], onDelete: Cascade)
+
+  stepId   String   @map("step_id")
+  step     OfferStep @relation(fields: [stepId], references: [id], onDelete: Cascade)
+
+  payload     String     @default("{}") // User input data
+  fileRefs    String @default("[]") @map("file_refs") // JSON array of S3 keys
+  completedAt DateTime? @map("completed_at")
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  @@unique([taskId, stepId])
+  @@index([taskId])
+  @@map("task_step_data")
+}
+
+// ============================================================================
+// CHAT SYSTEM
+// ============================================================================
+
+enum ChatType {
+  SUPPORT // General support
+  TASK    // Task-specific chat
+}
+
+enum ChatStatus {
+  OPEN
+  CLOSED
+}
+
+model Chat {
+  id        String     @id @default(uuid())
+  tenantId  String     @map("tenant_id")
+  tenant    Tenant     @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  type      ChatType   @default(SUPPORT)
+  status    ChatStatus @default(OPEN)
+
+  taskId    String?    @map("task_id")
+  task      Task?      @relation(fields: [taskId], references: [id], onDelete: Cascade)
+
+  userId    String     @map("user_id") // User (executor)
+  user      User       @relation("UserChats", fields: [userId], references: [id], onDelete: Cascade)
+
+  managerId String?    @map("manager_id") // Assigned manager
+  manager   User?      @relation("ManagerChats", fields: [managerId], references: [id])
+
+  createdAt DateTime   @default(now()) @map("created_at")
+  updatedAt DateTime   @updatedAt @map("updated_at")
+
+  // Relations
+  messages ChatMessage[]
+
+  @@index([tenantId])
+  @@index([userId])
+  @@index([managerId])
+  @@index([taskId])
+  @@map("chats")
+}
+
+enum MessageSenderRole {
+  USER
+  MANAGER
+  SYSTEM
+}
+
+model ChatMessage {
+  id       String            @id @default(uuid())
+  chatId   String            @map("chat_id")
+  chat     Chat              @relation(fields: [chatId], references: [id], onDelete: Cascade)
+
+  senderId String            @map("sender_id")
+  sender   User              @relation(fields: [senderId], references: [id], onDelete: Cascade)
+
+  senderRole MessageSenderRole @map("sender_role")
+
+  body        String 
+  attachments String   @default("[]") // [{url, type, name, size}]
+  isRead      Boolean @default(false) @map("is_read")
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@index([chatId, createdAt])
+  @@map("chat_messages")
+}
+
+// ============================================================================
+// LEDGER SYSTEM
+// ============================================================================
+
+model LedgerAccount {
+  id     String @id @default(uuid())
+  userId String @unique @map("user_id")
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  currency String @default("RUB")
+
+  // Cached balances (source of truth is ledger_entries)
+  balanceAvailable Decimal @default(0)  @map("balance_available")
+  balancePending   Decimal @default(0)  @map("balance_pending")
+  balanceFrozen    Decimal @default(0)  @map("balance_frozen")
+
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  // Relations
+  entries LedgerEntry[]
+
+  @@index([userId])
+  @@map("ledger_accounts")
+}
+
+enum LedgerEntryType {
+  CREDIT // Income
+  DEBIT  // Expense
+}
+
+enum LedgerEntryCategory {
+  TASK_REWARD
+  REFERRAL_COMMISSION
+  REIMBURSEMENT
+  PAYOUT
+  ADJUSTMENT
+  MANUAL
+}
+
+enum LedgerEntryStatus {
+  PENDING
+  COMPLETED
+  CANCELLED
+}
+
+enum LedgerRefType {
+  TASK
+  PAYOUT
+  REFERRAL
+  MANUAL
+}
+
+model LedgerEntry {
+  id        String             @id @default(uuid())
+  accountId String             @map("account_id")
+  account   LedgerAccount      @relation(fields: [accountId], references: [id], onDelete: Cascade)
+
+  type     LedgerEntryType
+  category LedgerEntryCategory
+  amount   Decimal             
+  status   LedgerEntryStatus   @default(PENDING)
+
+  // Reference to source entity
+  refType LedgerRefType
+  refId   String        @map("ref_id") // ID of task/payout/etc
+
+  description String 
+  metadata    String   @default("{}")
+
+  createdById String? @map("created_by_id") // For MANUAL adjustments
+  createdBy   User?   @relation("CreatedByUser", fields: [createdById], references: [id])
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@index([accountId, createdAt])
+  @@index([refType, refId])
+  @@map("ledger_entries")
+}
+
+// ============================================================================
+// PAYOUTS
+// ============================================================================
+
+enum PayoutStatus {
+  REQUESTED
+  REVIEWING
+  APPROVED
+  PROCESSING
+  PAID
+  REJECTED
+  CANCELLED
+}
+
+model PayoutRequest {
+  id       String       @id @default(uuid())
+  userId   String       @map("user_id")
+  user     User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  tenantId String       @map("tenant_id")
+  tenant   Tenant       @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  amount Decimal      
+  method String         // {type: "card", details: {...}}
+  status PayoutStatus @default(REQUESTED)
+
+  requestedAt DateTime  @default(now()) @map("requested_at")
+  reviewedAt  DateTime? @map("reviewed_at")
+  reviewedById String?  @map("reviewed_by_id")
+  paidAt      DateTime? @map("paid_at")
+
+  rejectionReason String?  @map("rejection_reason")
+  transactionId   String? @map("transaction_id") // External transaction ID
+
+  metadata String @default("{}")
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@index([userId])
+  @@index([tenantId])
+  @@index([status])
+  @@map("payout_requests")
+}
+
+// ============================================================================
+// AUDIT & SECURITY
+// ============================================================================
+
+enum AuditAction {
+  CREATE
+  UPDATE
+  DELETE
+  APPROVE
+  REJECT
+  LOGIN
+  LOGOUT
+  PAYOUT
+  ADJUSTMENT
+}
+
+model AuditLog {
+  id       String      @id @default(uuid())
+  tenantId String      @map("tenant_id")
+  tenant   Tenant      @relation("TenantAuditLogs", fields: [tenantId], references: [id], onDelete: Cascade)
+
+  actorId String      @map("actor_id")
+  actor   User        @relation("ActorAuditLogs", fields: [actorId], references: [id], onDelete: Cascade)
+
+  action     AuditAction
+  entityType String      @map("entity_type") // "offer", "task", "user", "payout"
+  entityId   String      @map("entity_id")
+
+  beforeState Json? @map("before_state")
+  afterState  Json? @map("after_state")
+
+  ipAddress String? @map("ip_address")
+  userAgent String? @map("user_agent")
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@index([actorId, createdAt])
+  @@index([entityType, entityId])
+  @@map("audit_logs")
+}
